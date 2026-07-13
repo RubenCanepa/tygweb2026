@@ -46,20 +46,39 @@
 		const labels = movieList.map(m => m.title);
 		const ratings = movieList.map(m => m.vote_average);
 
+		const avg = movieList.length > 0 
+			? Number((movieList.reduce((sum, m) => sum + Number(m.vote_average), 0) / movieList.length).toFixed(2)) 
+			: 0;
+
 		chartInstance = new Chart(canvasElement, {
 			type: 'bar',
 			data: {
 				labels: labels,
-				datasets: [{
-					label: 'Rating Promedio (Vote Average)',
-					data: ratings,
-					backgroundColor: 'rgba(6, 182, 212, 0.45)', // Custom Cyan glow
-					borderColor: '#06b6d4',
-					borderWidth: 1.5,
-					borderRadius: 6,
-					hoverBackgroundColor: 'rgba(139, 92, 246, 0.65)', // Custom Purple glow
-					hoverBorderColor: '#8b5cf6'
-				}]
+				datasets: [
+					{
+						label: 'Rating de Película (Vote Average)',
+						data: ratings,
+						backgroundColor: 'rgba(6, 182, 212, 0.45)', // Custom Cyan glow
+						borderColor: '#06b6d4',
+						borderWidth: 1.5,
+						borderRadius: 6,
+						hoverBackgroundColor: 'rgba(139, 92, 246, 0.65)', // Custom Purple glow
+						hoverBorderColor: '#8b5cf6',
+						order: 2
+					},
+					{
+						type: 'line',
+						label: `Promedio de Selección (${avg.toFixed(2)})`,
+						data: new Array(movieList.length).fill(avg),
+						borderColor: '#f43f5e', // Custom Rose color for contrast
+						borderWidth: 2.5,
+						borderDash: [6, 4],
+						pointRadius: 0,
+						pointHoverRadius: 0,
+						fill: false,
+						order: 1
+					}
+				]
 			},
 			options: {
 				responsive: true,
@@ -235,7 +254,7 @@
 	<!-- Header -->
 	<header class="app-header">
 		<h1 class="app-title-gradient">TP Nro 2 - Tecnología y Gestión Web</h1>
-		<span class="app-group-badge" id="group-badge">Grupo [NombreGrupo]</span>
+		<span class="app-group-badge" id="group-badge">Grupo CANEPA - Cursada 2017</span>
 	</header>
 
 	<div class="main-layout">
@@ -389,5 +408,6 @@
 	<!-- Footer -->
 	<footer class="app-footer">
 		<p>TygWeb 2026 - Tecnología y Gestión Web (UTN FRLP)</p>
+		<p>Ruben Canepa - Leg 12489 - Cursada Aprobada 2017</p>  
 	</footer>
 </div>

@@ -93,17 +93,14 @@ export async function POST({ request }) {
 			});
 		}
 
-		let savedCount = 0;
-		const errors = [];
-
-		// 2. Process each movie and sync it to the active storage layer (without city field)
-		for (const movie of movies) {
+		// 2. Process all movies and prepare the batch
+		const peliculasList = movies.map(movie => {
 			const posterUrl = movie.poster_path
 				? `https://image.tmdb.org/t/p/w500${movie.poster_path}`
 				: null;
 
 			// Map TMDB fields (no 'ciudad' field according to rules)
-			const movieData = {
+			return {
 				title: movie.title,
 				overview: movie.overview || '',
 				poster_path: posterUrl,
@@ -111,27 +108,18 @@ export async function POST({ request }) {
 				release_date: movie.release_date || null,
 				tmdb_id: movie.id
 			};
+		});
 
-			try {
-				// Persist via active adapter
-				await storage.guardarPelicula(movieData);
-				savedCount++;
-			} catch (err) {
-				console.error(`[generar] Error guardando película id ${movie.id} (${movie.title}):`, err);
-				errors.push({
-					id: movie.id,
-					title: movie.title,
-					error: err.message
-				});
-			}
-		}
+		// 3. Reemplazar la base de datos completa con el nuevo lote a través del adaptador activo
+		console.log(`[generar] Reemplazando base de datos completa con el lote de ${peliculasList.length} películas (${storageMode.toUpperCase()})...`);
+		const resultEnvelope = await storage.reemplazarPeliculas(peliculasList);
+		const savedCount = resultEnvelope?.data?.length || 0;
 
 		return json({
 			success: true,
-			message: `Sincronización finalizada (${storageMode.toUpperCase()}). Se obtuvieron ${maxPages} página(s) de TMDB y se guardaron/actualizaron ${savedCount} de ${cantidad} películas solicitadas.`,
+			message: `Sincronización finalizada (${storageMode.toUpperCase()}). Se obtuvieron ${maxPages} página(s) de TMDB y se reemplazó la base de datos con las ${savedCount} películas solicitadas.`,
 			count: savedCount,
-			pages_fetched: maxPages,
-			errors: errors.length > 0 ? errors : undefined
+			pages_fetched: maxPages
 		});
 
 	} catch (error) {

@@ -106,5 +106,23 @@ export const jsonStorage = {
 
 		await writeAll({ data: list });
 		return savedItem;
+	},
+
+	/**
+	 * Replaces the entire local collection of movies with a new set.
+	 * @param {Array<object>} peliculas - List of movie data objects.
+	 * @returns {Promise<{ data: Array }>}
+	 */
+	async reemplazarPeliculas(peliculas) {
+		console.log(`[jsonStorage] Reemplazando todas las películas del archivo local con ${peliculas.length} nuevas películas.`);
+		const list = peliculas.map((movieData, index) => ({
+			id: index + 1,
+			attributes: {
+				...movieData
+			}
+		}));
+		const dataEnvelope = { data: list };
+		await writeAll(dataEnvelope);
+		return dataEnvelope;
 	}
 };

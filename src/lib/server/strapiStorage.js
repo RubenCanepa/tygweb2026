@@ -108,5 +108,77 @@ export const strapiStorage = {
 
 		const result = await finalRes.json();
 		return result.data;
+	},
+
+	/**
+	 * Replaces the entire collection of movies in Strapi.
+	 * First deletes all existing records by calling DELETE sequentially on their IDs,
+	 * then creates (POST) each movie from the new set.
+	 *
+	 * ⚠️ WARNING: Esta operación debe ser probada y validada exhaustivamente contra la 
+	 * instancia real de Strapi de la cátedra, ya que Strapi no dispone de un endpoint 
+	 * nativo para "borrar todo" y dependemos de la iteración individual de IDs.
+	 *
+	 * @param {Array<object>} peliculas - Nuevas películas a guardar
+	 * @returns {Promise<{ data: Array }>}
+	 */
+	async reemplazarPeliculas(peliculas) {
+		const headers = getHeaders();
+		
+		console.log(`[strapiStorage] Iniciando reemplazo total de películas en Strapi...`);
+		
+		// 1. Obtener todas las películas actuales para conocer sus IDs de Strapi
+		let actuales = [];
+		try {
+			const res = await this.obtenerPeliculas();
+			actuales = res.data || [];
+		} catch (err) {
+			console.warn(`[strapiStorage] Advertencia al obtener películas previas para borrar: ${err.message}. Continuando...`);
+		}
+
+		// 2. Eliminar cada película actual de a una por su ID de Strapi
+		console.log(`[strapiStorage] Eliminando ${actuales.length} películas existentes en Strapi...`);
+		for (const item of actuales) {
+			const deleteUrl = `${strapiBaseUrl}/api/peliculas/${item.id}`;
+			try {
+				const delRes = await fetch(deleteUrl, {
+					method: 'DELETE',
+					headers
+				});
+				if (!delRes.ok) {
+					console.error(`[strapiStorage] Error al eliminar película con ID Strapi ${item.id}: ${delRes.status}`);
+				}
+			} catch (err) {
+				console.error(`[strapiStorage] Excepción al eliminar película con ID Strapi ${item.id}:`, err);
+			}
+		}
+
+		// 3. Crear las nuevas películas (POST)
+		console.log(`[strapiStorage] Creando ${peliculas.length} películas en Strapi...`);
+		const creadas = [];
+		for (const movieData of peliculas) {
+			const createUrl = `${strapiBaseUrl}/api/peliculas`;
+			try {
+				const res = await fetch(createUrl, {
+					method: 'POST',
+					headers,
+					body: JSON.stringify({ data: movieData })
+				});
+
+				if (!res.ok) {
+					throw new Error(`Error en Strapi POST al crear: ${res.status} ${res.statusText}`);
+				}
+
+				const result = await res.json();
+				if (result.data) {
+					creadas.push(result.data);
+				}
+			} catch (err) {
+				console.error(`[strapiStorage] Error creando película "${movieData.title}" en Strapi:`, err);
+				throw err;
+			}
+		}
+
+		return { data: creadas };
 	}
 };
