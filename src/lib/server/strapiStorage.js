@@ -1,4 +1,4 @@
-import { STRAPI_API_URL, STRAPI_API_TOKEN } from '$env/static/private';
+import { STRAPI_API_URL, STRAPI_API_TOKEN, STRAPI_ENDPOINT } from '$env/static/private';
 
 /**
  * =========================================================================
@@ -7,10 +7,39 @@ import { STRAPI_API_URL, STRAPI_API_TOKEN } from '$env/static/private';
  * DE LA CÁTEDRA.
  * ASEGURARSE DE CAMBIAR LA VARIABLE DE ENTORNO STORAGE_MODE=strapi EN EL 
  * ARCHIVO .env ANTES DE LA ENTREGA FINAL.
+ * 
+ * NOTA DE BULK DELETE: Dado que Strapi no cuenta con una operación nativa
+ * de "borrado masivo" en un solo llamado HTTP, primero solicitamos todos los
+ * IDs de las películas persistidas y realizamos peticiones DELETE individuales.
+ * Luego, insertamos la nueva tanda con peticiones POST.
  * =========================================================================
  */
 
 const strapiBaseUrl = STRAPI_API_URL || 'http://localhost:1337';
+const strapiEndpoint = STRAPI_ENDPOINT || 'canepa-peliculas';
+const apiPath = `${strapiBaseUrl}/api/${strapiEndpoint}`;
+
+const TIMEOUT_MS = 8000; // 8 segundos por request individual, ajustable
+
+/**
+ * Custom fetch helper that aborts after a timeout
+ */
+async function fetchConTimeout(url, options = {}, timeoutMs = TIMEOUT_MS) {
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+	try {
+		const res = await fetch(url, { ...options, signal: controller.signal });
+		clearTimeout(timeoutId);
+		return res;
+	} catch (err) {
+		clearTimeout(timeoutId);
+		if (err.name === 'AbortError') {
+			throw new Error(`Timeout de ${timeoutMs}ms superado en: ${url}`);
+		}
+		throw err;
+	}
+}
 
 /**
  * Generates headers for API requests to Strapi
@@ -34,11 +63,11 @@ export const strapiStorage = {
 	 * @returns {Promise<{ data: Array }>}
 	 */
 	async obtenerPeliculas() {
-		const queryUrl = `${strapiBaseUrl}/api/peliculas?pagination[limit]=100`;
+		const queryUrl = `${apiPath}?pagination[limit]=100`;
 		
-		console.log(`[strapiStorage] Obteniendo listado completo de películas desde Strapi...`);
+		console.log(`[strapiStorage] Obteniendo listado completo desde: ${queryUrl}`);
 		
-		const res = await fetch(queryUrl, {
+		const res = await fetchConTimeout(queryUrl, {
 			method: 'GET',
 			headers: getHeaders()
 		});
@@ -51,134 +80,210 @@ export const strapiStorage = {
 	},
 
 	/**
-	 * Creates or updates (upsert) a movie record in Strapi based on unique tmdb_id (no city field)
-	 * @param {object} movieData
-	 * @returns {Promise<object>}
-	 */
-	async guardarPelicula(movieData) {
-		const headers = getHeaders();
-		const checkUrl = `${strapiBaseUrl}/api/peliculas?filters[tmdb_id][$eq]=${movieData.tmdb_id}`;
-		
-		console.log(`[strapiStorage] Verificando existencia de tmdb_id=${movieData.tmdb_id} en Strapi...`);
-		
-		const checkRes = await fetch(checkUrl, {
-			method: 'GET',
-			headers
-		});
-
-		if (!checkRes.ok) {
-			throw new Error(`Error al verificar película en Strapi: ${checkRes.status}`);
-		}
-
-		const checkData = await checkRes.json();
-		const existingRecords = checkData.data || [];
-
-		let finalRes;
-
-		if (existingRecords.length > 0) {
-			// Update (PUT)
-			const existingId = existingRecords[0].id;
-			const updateUrl = `${strapiBaseUrl}/api/peliculas/${existingId}`;
-			console.log(`[strapiStorage] Película "${movieData.title}" existe con ID Strapi ${existingId}. Actualizando...`);
-
-			finalRes = await fetch(updateUrl, {
-				method: 'PUT',
-				headers,
-				body: JSON.stringify({ data: movieData })
-			});
-
-			if (!finalRes.ok) {
-				throw new Error(`Error al actualizar película en Strapi (ID: ${existingId}): ${finalRes.status}`);
-			}
-		} else {
-			// Create (POST)
-			const createUrl = `${strapiBaseUrl}/api/peliculas`;
-			console.log(`[strapiStorage] Película "${movieData.title}" es nueva. Creando en Strapi...`);
-
-			finalRes = await fetch(createUrl, {
-				method: 'POST',
-				headers,
-				body: JSON.stringify({ data: movieData })
-			});
-
-			if (!finalRes.ok) {
-				throw new Error(`Error al crear película en Strapi: ${finalRes.status}`);
-			}
-		}
-
-		const result = await finalRes.json();
-		return result.data;
-	},
-
-	/**
-	 * Replaces the entire collection of movies in Strapi.
-	 * First deletes all existing records by calling DELETE sequentially on their IDs,
-	 * then creates (POST) each movie from the new set.
-	 *
-	 * ⚠️ WARNING: Esta operación debe ser probada y validada exhaustivamente contra la 
-	 * instancia real de Strapi de la cátedra, ya que Strapi no dispone de un endpoint 
-	 * nativo para "borrar todo" y dependemos de la iteración individual de IDs.
-	 *
-	 * @param {Array<object>} peliculas - Nuevas películas a guardar
+	 * Deletes all existing records and uploads the new batch (Deprecated)
+	 * @param {Array<object>} peliculas - New movies collection
 	 * @returns {Promise<{ data: Array }>}
 	 */
 	async reemplazarPeliculas(peliculas) {
 		const headers = getHeaders();
-		
-		console.log(`[strapiStorage] Iniciando reemplazo total de películas en Strapi...`);
-		
-		// 1. Obtener todas las películas actuales para conocer sus IDs de Strapi
-		let actuales = [];
-		try {
-			const res = await this.obtenerPeliculas();
-			actuales = res.data || [];
-		} catch (err) {
-			console.warn(`[strapiStorage] Advertencia al obtener películas previas para borrar: ${err.message}. Continuando...`);
-		}
+		const inicioTotal = Date.now();
 
-		// 2. Eliminar cada película actual de a una por su ID de Strapi
-		console.log(`[strapiStorage] Eliminando ${actuales.length} películas existentes en Strapi...`);
-		for (const item of actuales) {
-			const deleteUrl = `${strapiBaseUrl}/api/peliculas/${item.id}`;
+		// --- FASE 1: Borrado ---
+		console.log(`[strapiStorage] === INICIO reemplazarPeliculas (${peliculas.length} nuevas) ===`);
+		const inicioBorrado = Date.now();
+		let totalBorradas = 0;
+
+		while (true) {
+			const currentRes = await fetchConTimeout(
+				`${apiPath}?pagination[pageSize]=100&pagination[page]=1`,
+				{ method: 'GET', headers },
+				TIMEOUT_MS
+			);
+
+			if (!currentRes.ok) {
+				throw new Error(`Error al recuperar lista previa de Strapi: ${currentRes.status}`);
+			}
+
+			const currentData = await currentRes.json();
+			const oldRecords = currentData.data || [];
+			if (oldRecords.length === 0) break;
+
+			console.log(`[strapiStorage] Lote de ${oldRecords.length} registros a borrar...`);
+
+			for (let i = 0; i < oldRecords.length; i++) {
+				const record = oldRecords[i];
+				const t0 = Date.now();
+				try {
+					const delRes = await fetchConTimeout(
+						`${apiPath}/${record.id}`,
+						{ method: 'DELETE', headers },
+						TIMEOUT_MS
+					);
+					const ms = Date.now() - t0;
+					if (!delRes.ok) {
+						console.warn(`[strapiStorage] DELETE id=${record.id} FALLÓ (${delRes.status}) en ${ms}ms`);
+					} else {
+						totalBorradas++;
+						if ((i + 1) % 5 === 0 || i === oldRecords.length - 1) {
+							console.log(`[strapiStorage] Borrado ${i + 1}/${oldRecords.length} (id=${record.id}, ${ms}ms)`);
+						}
+					}
+				} catch (err) {
+					console.error(`[strapiStorage] DELETE id=${record.id} ERROR tras ${Date.now() - t0}ms:`, err.message);
+				}
+			}
+		}
+		console.log(`[strapiStorage] FASE 1 completa: ${totalBorradas} borradas en ${Date.now() - inicioBorrado}ms`);
+
+		// --- FASE 2: Inserción ---
+		const inicioInsercion = Date.now();
+		console.log(`[strapiStorage] Subiendo ${peliculas.length} películas nuevas...`);
+		const uploadedList = [];
+
+		for (let i = 0; i < peliculas.length; i++) {
+			const movie = peliculas[i];
+			const t0 = Date.now();
+			const payload = {
+				title: movie.title,
+				overview: movie.overview || '',
+				poster_path: movie.poster_path,
+				vote_average: Number(movie.vote_average) || 0,
+				release_date: movie.release_date || null,
+				tmdb_id: Number(movie.tmdb_id)
+			};
+
 			try {
-				const delRes = await fetch(deleteUrl, {
-					method: 'DELETE',
-					headers
-				});
-				if (!delRes.ok) {
-					console.error(`[strapiStorage] Error al eliminar película con ID Strapi ${item.id}: ${delRes.status}`);
+				const createRes = await fetchConTimeout(
+					apiPath,
+					{ method: 'POST', headers, body: JSON.stringify({ data: payload }) },
+					TIMEOUT_MS
+				);
+				const ms = Date.now() - t0;
+
+				if (!createRes.ok) {
+					throw new Error(`Código ${createRes.status}`);
+				}
+
+				const resObj = await createRes.json();
+				if (resObj.data) uploadedList.push(resObj.data);
+
+				if ((i + 1) % 5 === 0 || i === peliculas.length - 1) {
+					console.log(`[strapiStorage] Insertada ${i + 1}/${peliculas.length}: "${movie.title}" (${ms}ms)`);
 				}
 			} catch (err) {
-				console.error(`[strapiStorage] Excepción al eliminar película con ID Strapi ${item.id}:`, err);
+				console.error(`[strapiStorage] POST "${movie.title}" ERROR tras ${Date.now() - t0}ms:`, err.message);
 			}
 		}
 
-		// 3. Crear las nuevas películas (POST)
-		console.log(`[strapiStorage] Creando ${peliculas.length} películas en Strapi...`);
-		const creadas = [];
-		for (const movieData of peliculas) {
-			const createUrl = `${strapiBaseUrl}/api/peliculas`;
-			try {
-				const res = await fetch(createUrl, {
-					method: 'POST',
-					headers,
-					body: JSON.stringify({ data: movieData })
-				});
+		console.log(`[strapiStorage] FASE 2 completa: ${uploadedList.length}/${peliculas.length} subidas en ${Date.now() - inicioInsercion}ms`);
+		console.log(`[strapiStorage] === FIN reemplazarPeliculas: ${Date.now() - inicioTotal}ms totales ===`);
 
-				if (!res.ok) {
-					throw new Error(`Error en Strapi POST al crear: ${res.status} ${res.statusText}`);
+		return { data: uploadedList };
+	},
+
+	/**
+	 * Upsert: actualiza las películas existentes (match por tmdb_id) e inserta
+	 * las nuevas. No borra nada.
+	 * @param {Array<object>} peliculas
+	 * @returns {Promise<{ data: Array, stats: object }>}
+	 */
+	async sincronizarPeliculas(peliculas) {
+		const headers = getHeaders();
+		const inicioTotal = Date.now();
+
+		console.log(`[strapiStorage] === INICIO sincronizarPeliculas (${peliculas.length} películas) ===`);
+
+		// 1. Traer TODO lo existente (paginando si hace falta, no asumir tope)
+		const existentes = [];
+		let page = 1;
+		while (true) {
+			const res = await fetchConTimeout(
+				`${apiPath}?pagination[pageSize]=100&pagination[page]=${page}`,
+				{ method: 'GET', headers },
+				TIMEOUT_MS
+			);
+			if (!res.ok) throw new Error(`Error al listar existentes: ${res.status}`);
+			const data = await res.json();
+			const items = data.data || [];
+			existentes.push(...items);
+			const totalPages = data.meta?.pagination?.pageCount || 1;
+			if (page >= totalPages || items.length === 0) break;
+			page++;
+		}
+
+		// 2. Mapa tmdb_id -> id de Strapi, para saber si es update o insert
+		const mapaExistente = new Map();
+		for (const item of existentes) {
+			const attrs = item.attributes || item; // soporta v4 (con attributes) y v5 (plano)
+			if (attrs.tmdb_id != null) {
+				mapaExistente.set(Number(attrs.tmdb_id), item.id);
+			}
+		}
+		console.log(`[strapiStorage] ${mapaExistente.size} películas existentes detectadas para posible update.`);
+
+		// 3. Recorrer el lote nuevo: PUT si existe, POST si no
+		let actualizadas = 0;
+		let creadas = 0;
+		let fallidas = 0;
+		const resultado = [];
+
+		for (let i = 0; i < peliculas.length; i++) {
+			const movie = peliculas[i];
+			const t0 = Date.now();
+			const payload = {
+				title: movie.title,
+				overview: movie.overview || '',
+				poster_path: movie.poster_path,
+				vote_average: Number(movie.vote_average) || 0,
+				release_date: movie.release_date || null,
+				tmdb_id: Number(movie.tmdb_id)
+			};
+
+			const strapiId = mapaExistente.get(Number(movie.tmdb_id));
+
+			try {
+				let res;
+				if (strapiId) {
+					// UPDATE
+					res = await fetchConTimeout(
+						`${apiPath}/${strapiId}`,
+						{ method: 'PUT', headers, body: JSON.stringify({ data: payload }) },
+						TIMEOUT_MS
+					);
+				} else {
+					// INSERT
+					res = await fetchConTimeout(
+						apiPath,
+						{ method: 'POST', headers, body: JSON.stringify({ data: payload }) },
+						TIMEOUT_MS
+					);
 				}
 
-				const result = await res.json();
-				if (result.data) {
-					creadas.push(result.data);
+				if (!res.ok) throw new Error(`Código ${res.status}`);
+
+				const resObj = await res.json();
+				if (resObj.data) resultado.push(resObj.data);
+
+				if (strapiId) actualizadas++; else creadas++;
+
+				if ((i + 1) % 5 === 0 || i === peliculas.length - 1) {
+					console.log(
+						`[strapiStorage] ${i + 1}/${peliculas.length} — "${movie.title}" ` +
+						`(${strapiId ? 'UPDATE' : 'INSERT'}, ${Date.now() - t0}ms)`
+					);
 				}
 			} catch (err) {
-				console.error(`[strapiStorage] Error creando película "${movieData.title}" en Strapi:`, err);
-				throw err;
+				fallidas++;
+				console.error(`[strapiStorage] Falló "${movie.title}" (tmdb_id=${movie.tmdb_id}):`, err.message);
+				// seguimos con el resto, un fallo puntual no frena todo el lote
 			}
 		}
 
-		return { data: creadas };
+		console.log(
+			`[strapiStorage] === FIN sincronizarPeliculas: ${actualizadas} actualizadas, ${creadas} creadas, ` +
+			`${fallidas} fallidas, en ${Date.now() - inicioTotal}ms ===`
+		);
+
+		return { data: resultado, stats: { actualizadas, creadas, fallidas } };
 	}
 };

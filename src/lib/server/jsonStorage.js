@@ -67,62 +67,96 @@ export const jsonStorage = {
 	},
 
 	/**
-	 * Creates or updates a movie in the local JSON database (agnostic of city)
-	 * @param {object} movieData - The movie fields to save
-	 * @returns {Promise<object>} - The saved movie item
+	 * Empties the database and saves the new movie list (Deprecated)
+	 * @param {Array<object>} peliculas - The new batch of movie fields
+	 * @returns {Promise<{ data: Array }>} - The saved list wrapped in a Strapi response envelope
 	 */
-	async guardarPelicula(movieData) {
-		const db = await readAll();
-		const list = db.data || [];
-
-		// Look for duplicate using tmdb_id
-		const existingIndex = list.findIndex(item => 
-			item.attributes && 
-			Number(item.attributes.tmdb_id) === Number(movieData.tmdb_id)
-		);
-
-		let savedItem;
-
-		if (existingIndex !== -1) {
-			// Update existing item
-			list[existingIndex].attributes = {
-				...list[existingIndex].attributes,
-				...movieData
-			};
-			savedItem = list[existingIndex];
-			console.log(`[jsonStorage] Película "${movieData.title}" (tmdb_id: ${movieData.tmdb_id}) actualizada en JSON.`);
-		} else {
-			// Create new item
-			const nextId = list.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0) + 1;
-			savedItem = {
-				id: nextId,
+	async reemplazarPeliculas(peliculas) {
+		const formattedList = peliculas.map((movie, index) => {
+			return {
+				id: index + 1,
 				attributes: {
-					...movieData
+					title: movie.title,
+					overview: movie.overview,
+					poster_path: movie.poster_path,
+					vote_average: Number(movie.vote_average) || 0,
+					release_date: movie.release_date,
+					tmdb_id: Number(movie.tmdb_id)
 				}
 			};
-			list.push(savedItem);
-			console.log(`[jsonStorage] Película "${movieData.title}" (tmdb_id: ${movieData.tmdb_id}) creada en JSON.`);
-		}
+		});
 
-		await writeAll({ data: list });
-		return savedItem;
+		const envelope = { data: formattedList };
+		await writeAll(envelope);
+		console.log(`[jsonStorage] Catálogo reemplazado por completo con ${peliculas.length} películas.`);
+		return envelope;
 	},
 
 	/**
-	 * Replaces the entire local collection of movies with a new set.
-	 * @param {Array<object>} peliculas - List of movie data objects.
-	 * @returns {Promise<{ data: Array }>}
+	 * Performs an upsert: updates existing movies (matching by tmdb_id)
+	 * and inserts new ones. Does not delete any records.
+	 * @param {Array<object>} peliculas - Batch of movie fields to sync
+	 * @returns {Promise<{ data: Array, stats: object }>}
 	 */
-	async reemplazarPeliculas(peliculas) {
-		console.log(`[jsonStorage] Reemplazando todas las películas del archivo local con ${peliculas.length} nuevas películas.`);
-		const list = peliculas.map((movieData, index) => ({
-			id: index + 1,
-			attributes: {
-				...movieData
+	async sincronizarPeliculas(peliculas) {
+		const actualesEnvelope = await readAll();
+		const actuales = actualesEnvelope.data || [];
+
+		// Load existing movies into Map keyed by tmdb_id
+		const mapa = new Map();
+		for (const item of actuales) {
+			const attrs = item.attributes || item;
+			if (attrs.tmdb_id != null) {
+				mapa.set(Number(attrs.tmdb_id), item);
 			}
-		}));
-		const dataEnvelope = { data: list };
-		await writeAll(dataEnvelope);
-		return dataEnvelope;
+		}
+
+		let actualizadas = 0;
+		let creadas = 0;
+
+		for (const movie of peliculas) {
+			const existingItem = mapa.get(Number(movie.tmdb_id));
+			const movieAttrs = {
+				title: movie.title,
+				overview: movie.overview || '',
+				poster_path: movie.poster_path,
+				vote_average: Number(movie.vote_average) || 0,
+				release_date: movie.release_date || null,
+				tmdb_id: Number(movie.tmdb_id)
+			};
+
+			if (existingItem) {
+				// UPDATE in memory
+				existingItem.attributes = {
+					...existingItem.attributes,
+					...movieAttrs
+				};
+				actualizadas++;
+			} else {
+				// INSERT in memory: calculate next ID
+				const nextId = Array.from(mapa.values()).reduce(
+					(max, item) => Math.max(max, Number(item.id) || 0), 
+					0
+				) + 1;
+
+				const newItem = {
+					id: nextId,
+					attributes: movieAttrs
+				};
+
+				mapa.set(Number(movie.tmdb_id), newItem);
+				creadas++;
+			}
+		}
+
+		const resultado = Array.from(mapa.values());
+		await writeAll({ data: resultado });
+
+		console.log(`[jsonStorage] Sincronización JSON completa: ${actualizadas} actualizadas, ${creadas} creadas.`);
+		
+		return { 
+			data: resultado, 
+			stats: { actualizadas, creadas, fallidas: 0 } 
+		};
 	}
 };

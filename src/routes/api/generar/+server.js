@@ -2,42 +2,33 @@ import { json } from '@sveltejs/kit';
 import { TMDB_API_TOKEN } from '$env/static/private';
 import { storage, storageMode } from '$lib/server/storage.js';
 
-const TMDB_PAGE_SIZE = 20; // TMDB always returns 20 results per page
+const GLOBAL_TIMEOUT_MS = 90000;
 
-/**
- * Fetches a single page from TMDB now_playing endpoint.
- * @param {number} page - Page number (1-indexed)
- * @param {string} token - Bearer token
- * @returns {Promise<{results: Array, total_pages: number}>}
- */
-async function fetchTmdbPage(page, token) {
-	const url = `https://api.themoviedb.org/3/movie/now_playing?language=es-AR&page=${page}`;
-	const response = await fetch(url, {
-		method: 'GET',
-		headers: {
-			Authorization: `Bearer ${token}`,
-			Accept: 'application/json'
-		}
-	});
-
-	if (!response.ok) {
-		const errText = await response.text();
-		throw new Error(`TMDB API error on page ${page}: ${response.status} ${response.statusText} — ${errText}`);
-	}
-
-	return response.json();
+function conTimeoutGlobal(promesa, ms) {
+	return Promise.race([
+		promesa,
+		new Promise((_, reject) =>
+			setTimeout(() => reject(new Error(`El proceso de sincronización superó ${ms / 1000}s.`)), ms)
+		)
+	]);
 }
 
 /**
- * Handles the POST request to fetch now-playing movies from TMDB
- * and stores/updates them in the active storage layer (JSON or Strapi).
- *
- * Accepts an optional JSON body: { cantidad: 20 | 40 | 60 }
- * Defaults to 20 (1 page). Iterates through as many TMDB pages as needed
- * to reach the requested quantity, then deduplicates and saves all movies.
+ * Handles POST requests to fetch a specific number of movies (20, 40, or 60)
+ * from TMDB by navigating through its pages and replacing the entire active storage.
  */
 export async function POST({ request }) {
 	try {
+		const { cantidad } = await request.json();
+		const numCantidad = Number(cantidad) || 20;
+
+		if (![20, 40, 60].includes(numCantidad)) {
+			return json(
+				{ error: 'La cantidad seleccionada debe ser 20, 40 o 60.' },
+				{ status: 400 }
+			);
+		}
+
 		if (!TMDB_API_TOKEN) {
 			return json(
 				{ error: 'El token TMDB_API_TOKEN no está configurado en el servidor.' },
@@ -45,61 +36,54 @@ export async function POST({ request }) {
 			);
 		}
 
-		// Parse optional body — default to 20 movies (1 page)
-		let cantidad = 20;
-		try {
-			const body = await request.json();
-			if (body?.cantidad && Number.isInteger(body.cantidad) && body.cantidad > 0) {
-				cantidad = body.cantidad;
-			}
-		} catch {
-			// No body or invalid JSON → use default
-		}
+		const paginasRequeridas = Math.ceil(numCantidad / 20);
+		let allResults = [];
 
-		// Calculate how many TMDB pages we need
-		const pagesNeeded = Math.ceil(cantidad / TMDB_PAGE_SIZE);
+		console.log(`[generar] Solicitando cantidad: ${numCantidad} (${paginasRequeridas} páginas de TMDB)`);
 
-		// 1. Fetch the first page to know the total available pages on TMDB
-		const firstPageData = await fetchTmdbPage(1, TMDB_API_TOKEN);
-		const tmdbTotalPages = firstPageData.total_pages ?? 1;
-		const maxPages = Math.min(pagesNeeded, tmdbTotalPages);
-
-		// Collect all movies, starting with page 1
-		const allMovies = [...(firstPageData.results || [])];
-
-		// Fetch remaining pages sequentially
-		for (let page = 2; page <= maxPages; page++) {
-			console.log(`[generar] Fetching TMDB page ${page}/${maxPages}…`);
-			const pageData = await fetchTmdbPage(page, TMDB_API_TOKEN);
-			allMovies.push(...(pageData.results || []));
-		}
-
-		// Deduplicate by TMDB id and trim to the requested quantity
-		const seen = new Set();
-		const movies = [];
-		for (const m of allMovies) {
-			if (!seen.has(m.id)) {
-				seen.add(m.id);
-				movies.push(m);
-				if (movies.length >= cantidad) break;
-			}
-		}
-
-		if (movies.length === 0) {
-			return json({
-				success: true,
-				message: 'No se encontraron películas en cartelera actualmente en TMDB.',
-				count: 0
+		// 1. Fetch TMDB page-by-page to collect enough movies
+		for (let page = 1; page <= paginasRequeridas; page++) {
+			const tmdbUrl = `https://api.themoviedb.org/3/movie/now_playing?language=es-AR&page=${page}`;
+			
+			const tmdbResponse = await fetch(tmdbUrl, {
+				method: 'GET',
+				headers: {
+					Authorization: `Bearer ${TMDB_API_TOKEN}`,
+					Accept: 'application/json'
+				}
 			});
+
+			if (!tmdbResponse.ok) {
+				const errText = await tmdbResponse.text();
+				console.error(`TMDB API Error en página ${page}:`, errText);
+				return json(
+					{ error: `Error de la API de TMDB en página ${page}: ${tmdbResponse.status} ${tmdbResponse.statusText}` },
+					{ status: 502 }
+				);
+			}
+
+			const tmdbData = await tmdbResponse.json();
+			const results = tmdbData.results || [];
+			allResults = allResults.concat(results);
 		}
 
-		// 2. Process all movies and prepare the batch
-		const peliculasList = movies.map(movie => {
-			const posterUrl = movie.poster_path
-				? `https://image.tmdb.org/t/p/w500${movie.poster_path}`
+		// Deduplicate before slicing (TMDB can return duplicate movies on different pages)
+		const vistos = new Set();
+		const sinDuplicados = allResults.filter((peli) => {
+			if (vistos.has(peli.id)) return false;
+			vistos.add(peli.id);
+			return true;
+		});
+
+		// 2. Slice to the exact count requested
+		const slicedResults = sinDuplicados.slice(0, numCantidad);
+
+		// 3. Map TMDB format to clean, storage-ready data (no city field)
+		const mappedMovies = slicedResults.map(movie => {
+			const posterUrl = movie.poster_path 
+				? `https://image.tmdb.org/t/p/w500${movie.poster_path}` 
 				: null;
 
-			// Map TMDB fields (no 'ciudad' field according to rules)
 			return {
 				title: movie.title,
 				overview: movie.overview || '',
@@ -110,16 +94,21 @@ export async function POST({ request }) {
 			};
 		});
 
-		// 3. Reemplazar la base de datos completa con el nuevo lote a través del adaptador activo
-		console.log(`[generar] Reemplazando base de datos completa con el lote de ${peliculasList.length} películas (${storageMode.toUpperCase()})...`);
-		const resultEnvelope = await storage.reemplazarPeliculas(peliculasList);
-		const savedCount = resultEnvelope?.data?.length || 0;
+		// 4. Overwrite storage completely with the new batch (wrapped in global timeout)
+		const resultEnvelope = await conTimeoutGlobal(
+			storage.sincronizarPeliculas(mappedMovies), 
+			GLOBAL_TIMEOUT_MS
+		);
+		const stats = resultEnvelope.stats || {};
+		const countPersisted = (resultEnvelope.data || []).length;
 
 		return json({
 			success: true,
-			message: `Sincronización finalizada (${storageMode.toUpperCase()}). Se obtuvieron ${maxPages} página(s) de TMDB y se reemplazó la base de datos con las ${savedCount} películas solicitadas.`,
-			count: savedCount,
-			pages_fetched: maxPages
+			message: `Sincronización finalizada (${storageMode.toUpperCase()}). ` +
+				(stats.actualizadas != null
+					? `${stats.creadas} nuevas, ${stats.actualizadas} actualizadas${stats.fallidas ? `, ${stats.fallidas} fallidas` : ''}.`
+					: `Se cargaron ${countPersisted} películas en el catálogo.`),
+			count: countPersisted
 		});
 
 	} catch (error) {
@@ -130,3 +119,4 @@ export async function POST({ request }) {
 		);
 	}
 }
+

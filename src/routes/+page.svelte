@@ -5,11 +5,15 @@
 
 	// Svelte 5 Runes for State Management
 	let ciudadSeleccionada = $state('Buenos Aires');
+	let cantidadSeleccionada = $state(20);
 	let allMovies = $state([]);
 	let loading = $state(false);
 	let loadingMessage = $state('');
 	let status = $state({ type: '', message: '' });
-	let cantidadPeliculas = $state(20);
+	let mostrarConfirmacionRecarga = $state(false);
+	let textoBusqueda = $state('');
+	let loadingElapsedSeconds = $state(0);
+	let elapsedInterval = null;
 
 	// Canvas reference for Chart.js
 	let canvasElement = $state(null);
@@ -29,6 +33,19 @@
 	
 	let movieCount = $derived(movies.length);
 
+	// Derived search-filtered movies (only affects cards rendering)
+	let moviesFiltradas = $derived(
+		movies.filter(m => {
+			if (!textoBusqueda.trim()) return true;
+			const normalize = str =>
+				(str || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+			const query = normalize(textoBusqueda);
+			const enTitulo = normalize(m.title).includes(query);
+			const enOverview = normalize(m.overview).includes(query);
+			return enTitulo || enOverview;
+		})
+	);
+
 	/**
 	 * Renders or updates the Chart.js bar chart
 	 */
@@ -46,39 +63,41 @@
 		const labels = movieList.map(m => m.title);
 		const ratings = movieList.map(m => m.vote_average);
 
-		const avg = movieList.length > 0 
-			? Number((movieList.reduce((sum, m) => sum + Number(m.vote_average), 0) / movieList.length).toFixed(2)) 
-			: 0;
+		const promedioLinePlugin = {
+			id: 'promedioLine',
+			afterDraw(chart) {
+				const { ctx, chartArea, scales } = chart;
+				const valor = Number(averageRating);
+				if (!chartArea || isNaN(valor) || valor === 0) return;
+
+				const y = scales.y.getPixelForValue(valor);
+				ctx.save();
+				ctx.strokeStyle = '#f87171'; // rojo suave, contrasta con cyan/violeta
+				ctx.setLineDash([6, 4]);
+				ctx.lineWidth = 2;
+				ctx.beginPath();
+				ctx.moveTo(chartArea.left, y);
+				ctx.lineTo(chartArea.right, y);
+				ctx.stroke();
+				ctx.restore();
+			}
+		};
 
 		chartInstance = new Chart(canvasElement, {
 			type: 'bar',
+			plugins: [promedioLinePlugin],
 			data: {
 				labels: labels,
-				datasets: [
-					{
-						label: 'Rating de Película (Vote Average)',
-						data: ratings,
-						backgroundColor: 'rgba(6, 182, 212, 0.45)', // Custom Cyan glow
-						borderColor: '#06b6d4',
-						borderWidth: 1.5,
-						borderRadius: 6,
-						hoverBackgroundColor: 'rgba(139, 92, 246, 0.65)', // Custom Purple glow
-						hoverBorderColor: '#8b5cf6',
-						order: 2
-					},
-					{
-						type: 'line',
-						label: `Promedio de Selección (${avg.toFixed(2)})`,
-						data: new Array(movieList.length).fill(avg),
-						borderColor: '#f43f5e', // Custom Rose color for contrast
-						borderWidth: 2.5,
-						borderDash: [6, 4],
-						pointRadius: 0,
-						pointHoverRadius: 0,
-						fill: false,
-						order: 1
-					}
-				]
+				datasets: [{
+					label: 'Rating Promedio (Vote Average)',
+					data: ratings,
+					backgroundColor: 'rgba(6, 182, 212, 0.45)', // Custom Cyan glow
+					borderColor: '#06b6d4',
+					borderWidth: 1.5,
+					borderRadius: 6,
+					hoverBackgroundColor: 'rgba(139, 92, 246, 0.65)', // Custom Purple glow
+					hoverBorderColor: '#8b5cf6'
+				}]
 			},
 			options: {
 				responsive: true,
@@ -166,7 +185,7 @@
 				status = {
 					type: 'info',
 					message: auto
-						? 'No hay películas cargadas en el sistema. Presioná "Cargar datos de APIs" para sincronizar.'
+						? 'No hay películas cargadas en el sistema. Seleccioná una cantidad y presioná "Cargar datos de APIs".'
 						: 'No se encontraron películas en la base de datos. Intentá cargando datos primero.'
 				};
 			} else {
@@ -189,12 +208,20 @@
 	}
 
 	/**
-	 * Triggers the intermediate API to import data from TMDB (once)
+	 * Triggers the intermediate API to import data from TMDB and overwrite storage
 	 */
 	async function cargarDatos() {
 		loading = true;
-		loadingMessage = `Llamando a la API Intermedia (TMDB → Storage) — solicitando ${cantidadPeliculas} películas...`;
+		loadingMessage = 'Llamando a la API Intermedia (TMDB → Storage)...';
+		loadingElapsedSeconds = 0;
 		status = { type: '', message: '' };
+
+		elapsedInterval = setInterval(() => {
+			loadingElapsedSeconds++;
+		}, 1000);
+
+		const controller = new AbortController();
+		const clientTimeoutId = setTimeout(() => controller.abort(), 100000); // 100s
 
 		try {
 			const res = await fetch('/api/generar', {
@@ -202,7 +229,8 @@
 				headers: {
 					'Content-Type': 'application/json'
 				},
-				body: JSON.stringify({ cantidad: cantidadPeliculas })
+				body: JSON.stringify({ cantidad: cantidadSeleccionada }),
+				signal: controller.signal
 			});
 
 			const resData = await res.json();
@@ -221,12 +249,28 @@
 
 		} catch (err) {
 			console.error('Error al sincronizar datos:', err);
+			const mensaje = err.name === 'AbortError'
+				? 'La sincronización tardó demasiado y se canceló. Probá con una cantidad menor (20) o reintentá en unos minutos.'
+				: `Error al sincronizar datos: ${err.message}`;
 			status = {
 				type: 'error',
-				message: `Error al sincronizar datos: ${err.message}`
+				message: mensaje
 			};
 		} finally {
+			clearTimeout(clientTimeoutId);
+			clearInterval(elapsedInterval);
 			loading = false;
+		}
+	}
+
+	/**
+	 * Decides whether to show the confirmation modal or load data directly
+	 */
+	function confirmarYCargar() {
+		if (allMovies.length > 0) {
+			mostrarConfirmacionRecarga = true;
+		} else {
+			cargarDatos();
 		}
 	}
 
@@ -234,6 +278,15 @@
 	$effect(() => {
 		if (canvasElement && movies) {
 			renderChart(movies);
+		}
+	});
+
+	// Lock body scroll when confirmation modal is visible
+	$effect(() => {
+		if (mostrarConfirmacionRecarga) {
+			document.body.style.overflow = 'hidden';
+		} else {
+			document.body.style.overflow = '';
 		}
 	});
 
@@ -250,11 +303,17 @@
 	});
 </script>
 
+<svelte:window onkeydown={(e) => {
+	if (e.key === 'Escape' && mostrarConfirmacionRecarga) {
+		mostrarConfirmacionRecarga = false;
+	}
+}} />
+
 <div class="app-container">
 	<!-- Header -->
 	<header class="app-header">
-		<h1 class="app-title-gradient">TP Nro 2 - Tecnología y Gestión Web</h1>
-		<span class="app-group-badge" id="group-badge">Grupo CANEPA - Cursada 2017</span>
+		<h1 class="app-title-gradient">TP Nro 2 - Grupo Canepa</h1>
+		<span class="app-group-badge" id="group-badge">TygWeb UTN FRLP</span>
 	</header>
 
 	<div class="main-layout">
@@ -276,28 +335,30 @@
 			</div>
 
 			<div class="sidebar-section">
-				<label class="sidebar-label" for="cantidad-select">Películas a cargar</label>
+				<label class="sidebar-label" for="quantity-select">Cantidad a cargar</label>
 				<select
-					id="cantidad-select"
+					id="quantity-select"
 					class="input-field"
-					style="background-color: #0b0f19; cursor: pointer; margin-bottom: 0.75rem;"
-					bind:value={cantidadPeliculas}
+					style="background-color: #0b0f19; cursor: pointer;"
+					bind:value={cantidadSeleccionada}
 					disabled={loading}
 				>
-					<option value={20} style="background-color: #0f172a; color: #f8fafc;">20 películas (1 página)</option>
-					<option value={40} style="background-color: #0f172a; color: #f8fafc;">40 películas (2 páginas)</option>
-					<option value={60} style="background-color: #0f172a; color: #f8fafc;">60 películas (3 páginas)</option>
+					<option value={20} style="background-color: #0f172a; color: #f8fafc;">20 películas</option>
+					<option value={40} style="background-color: #0f172a; color: #f8fafc;">40 películas</option>
+					<option value={60} style="background-color: #0f172a; color: #f8fafc;">60 películas</option>
 				</select>
+			</div>
 
+			<div class="sidebar-section">
 				<button
 					id="btn-cargar"
 					class="btn btn-primary"
-					onclick={cargarDatos}
+					onclick={confirmarYCargar}
 					disabled={loading}
 				>
 					{#if loading && loadingMessage.includes('TMDB')}
 						<div class="spinner"></div>
-						Sincronizando {cantidadPeliculas} películas...
+						Sincronizando...
 					{:else}
 						Cargar datos de APIs
 					{/if}
@@ -325,7 +386,7 @@
 			{#if loading}
 				<div class="status-container status-info">
 					<div class="spinner"></div>
-					<span>{loadingMessage}</span>
+					<span>{loadingMessage} ({loadingElapsedSeconds}s)</span>
 				</div>
 			{/if}
 
@@ -348,6 +409,12 @@
 			<!-- Gráfico de Barras (Chart.js) -->
 			<div class="chart-container glass-panel">
 				<h2 class="chart-title">Ratings por Película ({ciudadSeleccionada})</h2>
+				{#if movies.length > 0}
+					<div class="chart-legend" style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; color: var(--text-secondary); margin-top: -0.25rem; margin-bottom: 0.5rem;">
+						<span style="display: inline-block; width: 24px; border-bottom: 2px dashed #f87171;"></span>
+						<span>Promedio: {averageRating}</span>
+					</div>
+				{/if}
 				{#if movies.length === 0}
 					<div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 0.95rem; text-align: center; padding: 1rem;">
 						No hay películas que cumplan la condición para "{ciudadSeleccionada}" en el catálogo.<br>
@@ -361,17 +428,33 @@
 
 			<!-- Detalle de Películas (Grid de Cards) -->
 			<section aria-labelledby="movies-section-title">
-				<h2 id="movies-section-title" style="margin-bottom: 1.5rem; font-size: 1.5rem; font-family: 'Outfit', sans-serif;">
-					Películas en Cartelera
-				</h2>
+				<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem;">
+					<h2 id="movies-section-title" style="font-size: 1.5rem; font-family: 'Outfit', sans-serif; margin: 0;">
+						Películas en Cartelera
+					</h2>
+					{#if movies.length > 0}
+						<input
+							type="search"
+							aria-label="Buscar película por título o descripción"
+							placeholder="Buscar por título o descripción..."
+							class="input-field"
+							style="width: 100%; max-width: 320px; background-color: #0b0f19;"
+							bind:value={textoBusqueda}
+						/>
+					{/if}
+				</div>
 
 				{#if movies.length === 0}
 					<div class="glass-panel" style="padding: 3rem; text-align: center; color: var(--text-secondary);">
 						No hay películas cargadas para mostrar en esta sección bajo la regla de "{ciudadSeleccionada}".
 					</div>
+				{:else if moviesFiltradas.length === 0}
+					<div class="glass-panel" style="padding: 3rem; text-align: center; color: var(--text-secondary);">
+						Ninguna película coincide con '{textoBusqueda}'.
+					</div>
 				{:else}
 					<div class="movies-grid">
-						{#each movies as movie (movie.tmdb_id)}
+						{#each moviesFiltradas as movie (movie.tmdb_id)}
 							<article class="movie-card glass-panel">
 								<div class="movie-poster-container">
 									{#if movie.poster_path}
@@ -408,6 +491,47 @@
 	<!-- Footer -->
 	<footer class="app-footer">
 		<p>TygWeb 2026 - Tecnología y Gestión Web (UTN FRLP)</p>
-		<p>Ruben Canepa - Leg 12489 - Cursada Aprobada 2017</p>  
 	</footer>
+
+	{#if mostrarConfirmacionRecarga}
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div 
+			class="modal-backdrop"
+			onclick={() => mostrarConfirmacionRecarga = false}
+			style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 999;"
+		>
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div 
+				class="glass-panel modal-content"
+				onclick={(e) => e.stopPropagation()}
+				style="width: 90%; max-width: 500px; padding: 2rem; display: flex; flex-direction: column; gap: 1.5rem; border-color: rgba(255, 255, 255, 0.15);"
+			>
+				<h3 style="font-size: 1.25rem; font-family: 'Outfit', sans-serif; background: var(--accent-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin: 0;">
+					Confirmar sincronización de catálogo
+				</h3>
+				<p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.6; margin: 0;">
+					Se van a traer {cantidadSeleccionada} películas desde TMDB. Las que ya tengas cargadas se actualizan (no se duplican) y las nuevas se agregan al catálogo. ¿Confirmás?
+				</p>
+				<div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 0.5rem;">
+					<button 
+						class="btn btn-secondary"
+						onclick={() => mostrarConfirmacionRecarga = false}
+					>
+						Cancelar
+					</button>
+					<button 
+						class="btn btn-primary"
+						onclick={() => {
+							mostrarConfirmacionRecarga = false;
+							cargarDatos();
+						}}
+					>
+						Sí, sincronizar
+					</button>
+				</div>
+			</div>
+		</div>
+	{/if}
 </div>
