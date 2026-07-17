@@ -93,70 +93,45 @@ export const jsonStorage = {
 	},
 
 	/**
-	 * Performs an upsert: updates existing movies (matching by tmdb_id)
-	 * and inserts new ones. Does not delete any records.
+	 * Performs synchronization: inserts only new movies whose tmdb_id does not exist yet.
+	 * Does not delete, does not update existing ones.
 	 * @param {Array<object>} peliculas - Batch of movie fields to sync
 	 * @returns {Promise<{ data: Array, stats: object }>}
 	 */
 	async sincronizarPeliculas(peliculas) {
 		const actualesEnvelope = await readAll();
 		const actuales = actualesEnvelope.data || [];
+		const idsExistentes = new Set(actuales.map(p => Number(p.attributes?.tmdb_id || p.tmdb_id)));
 
-		// Load existing movies into Map keyed by tmdb_id
-		const mapa = new Map();
-		for (const item of actuales) {
-			const attrs = item.attributes || item;
-			if (attrs.tmdb_id != null) {
-				mapa.set(Number(attrs.tmdb_id), item);
-			}
-		}
-
-		let actualizadas = 0;
-		let creadas = 0;
-
-		for (const movie of peliculas) {
-			const existingItem = mapa.get(Number(movie.tmdb_id));
-			const movieAttrs = {
-				title: movie.title,
-				overview: movie.overview || '',
-				poster_path: movie.poster_path,
-				vote_average: Number(movie.vote_average) || 0,
-				release_date: movie.release_date || null,
-				tmdb_id: Number(movie.tmdb_id)
-			};
-
-			if (existingItem) {
-				// UPDATE in memory
-				existingItem.attributes = {
-					...existingItem.attributes,
-					...movieAttrs
-				};
-				actualizadas++;
-			} else {
-				// INSERT in memory: calculate next ID
-				const nextId = Array.from(mapa.values()).reduce(
-					(max, item) => Math.max(max, Number(item.id) || 0), 
-					0
-				) + 1;
-
-				const newItem = {
+		const nuevas = peliculas
+			.filter(p => !idsExistentes.has(Number(p.tmdb_id)))
+			.map((movie, index) => {
+				const nextId = actuales.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0) + index + 1;
+				return {
 					id: nextId,
-					attributes: movieAttrs
+					attributes: {
+						title: movie.title,
+						overview: movie.overview || '',
+						poster_path: movie.poster_path,
+						vote_average: Number(movie.vote_average) || 0,
+						release_date: movie.release_date || null,
+						tmdb_id: Number(movie.tmdb_id)
+					}
 				};
+			});
 
-				mapa.set(Number(movie.tmdb_id), newItem);
-				creadas++;
-			}
-		}
-
-		const resultado = Array.from(mapa.values());
+		const resultado = actuales.concat(nuevas);
 		await writeAll({ data: resultado });
 
-		console.log(`[jsonStorage] Sincronización JSON completa: ${actualizadas} actualizadas, ${creadas} creadas.`);
-		
+		console.log(`[jsonStorage] Sincronización JSON completa: ${nuevas.length} creadas, ${peliculas.length - nuevas.length} omitidas.`);
+
 		return { 
 			data: resultado, 
-			stats: { actualizadas, creadas, fallidas: 0 } 
+			stats: { 
+				creadas: nuevas.length, 
+				omitidas: peliculas.length - nuevas.length, 
+				fallidas: 0 
+			} 
 		};
 	}
 };

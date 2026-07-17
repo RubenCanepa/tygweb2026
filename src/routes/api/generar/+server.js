@@ -105,8 +105,8 @@ export async function POST({ request }) {
 		return json({
 			success: true,
 			message: `Sincronización finalizada (${storageMode.toUpperCase()}). ` +
-				(stats.actualizadas != null
-					? `${stats.creadas} nuevas, ${stats.actualizadas} actualizadas${stats.fallidas ? `, ${stats.fallidas} fallidas` : ''}.`
+				(stats.creadas != null
+					? `${stats.creadas} nuevas agregadas, ${stats.omitidas} ya existían (sin tocar)${stats.fallidas ? `, ${stats.fallidas} fallidas` : ''}.`
 					: `Se cargaron ${countPersisted} películas en el catálogo.`),
 			count: countPersisted
 		});

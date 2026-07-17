@@ -109,10 +109,3 @@ Los componentes principales del proyecto están organizados de la siguiente mane
 * 💻 [src/routes/+page.svelte](file:///home/ips-notebook-43292/utn/tygweb2026/src/routes/+page.svelte) - Interfaz principal del usuario. Contiene el selector de ciudad/cantidad, el gráfico estadístico (Chart.js), el motor de búsqueda y las tarjetas de películas.
 
 ---
-
-## 📋 Checklist de Tareas del Grupo
-
-- [ ] Investigación del sitio TMDB — *Asignado a:* `__________`
-- [ ] Creación de cuenta y autenticación en TMDB — *Asignado a:* `__________`
-- [ ] Relevamiento de APIs (TMDB `now_playing` + Strapi `/api/canepa-peliculas`) — *Asignado a:* `__________`
-- [ ] Bosquejo y diseño del frontend — *Asignado a:* `__________`
